@@ -1,4 +1,4 @@
-streamlit>=1.32,<1.50
+streamlit>=1.39,<1.50
 sympy>=1.12
 plotly>=5.18
 numpy>=1.24

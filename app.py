@@ -14,7 +14,7 @@ from scipy import ndimage, optimize
 from scipy import integrate as sci_int
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations, implicit_multiplication,
-    function_exponentiation, convert_xor,
+    implicit_application, function_exponentiation, convert_xor,
 )
 
 APP_TITLE = "Laboratorio Interactivo de Cálculo II"
@@ -40,8 +40,89 @@ _LOCALS = {
     "logb": lambda b, v: sp.log(v) / sp.log(b),
 }
 _TRANSF = standard_transformations + (
-    implicit_multiplication, function_exponentiation, convert_xor)
+    convert_xor, implicit_multiplication, implicit_application,
+    function_exponentiation)
 _PERMITIDOS = re.compile(r"^[0-9A-Za-z_+\-*/^()., \t]*$")
+
+_FUNCIONES = ["arcsen", "arccos", "arctg", "arccotg", "arcsin", "arctan", "senh",
+              "cosh", "tgh", "cotgh", "sinh", "tanh", "coth", "sen", "sin", "cos",
+              "tg", "tan", "cotg", "cot", "sec", "cosec", "csc", "ln", "logb",
+              "log", "exp", "sqrt", "raiz", "abs", "cbrt"]
+_CONOCIDOS = sorted(_FUNCIONES + ["pi", "oo", "x", "y", "t", "e"],
+                    key=lambda s: -len(s))
+_FN_RE = "|".join(sorted(_FUNCIONES, key=lambda s: -len(s)))
+_SUPER = {"²": "^2", "³": "^3", "⁴": "^4", "⁵": "^5", "⁶": "^6", "⁷": "^7",
+          "⁸": "^8", "⁹": "^9", "¹": "^1", "⁰": "^0"}
+
+
+def _segmentar(palabra):
+    """Parte una palabra pegada (p. ej. 'xsenx') en nombres conocidos."""
+    if palabra in _CONOCIDOS:
+        return [palabra]
+
+    def rec(s):
+        if not s:
+            return []
+        for nombre in _CONOCIDOS:
+            if s.startswith(nombre):
+                resto = rec(s[len(nombre):])
+                if resto is not None:
+                    return [nombre] + resto
+        return None
+    return rec(palabra)
+
+
+def _naturalizar(s):
+    """Convierte la escritura natural (x², |x|, sen x, 2x, xsen(x)…) a sintaxis
+    explícita antes de interpretarla."""
+    for k, v in _SUPER.items():
+        s = s.replace(k, v)
+    s = (s.replace("−", "-").replace("·", "*").replace("×", "*").replace("÷", "/")
+          .replace("π", "pi").replace("∞", "oo"))
+    s = re.sub(r"√\s*\(", "sqrt(", s)
+    s = re.sub(r"√\s*([A-Za-z0-9.]+)", r"sqrt(\1)", s)
+    # valor absoluto |...|
+    if "|" in s:
+        trozos = s.split("|")
+        if len(trozos) % 2 == 0:
+            raise ValueError("Falta cerrar una barra de valor absoluto |...|.")
+        s = trozos[0]
+        for i, tr in enumerate(trozos[1:], 1):
+            s += ("abs(" if i % 2 else ")") + tr
+    if "__" in s or not _PERMITIDOS.match(s):
+        raise ValueError(f"Caracteres no permitidos en «{s}».")
+    s = re.sub(r"(?<=\d),(?=\d)", ".", s)
+    s = re.sub(r"\blog_(\d+(?:\.\d+)?|[a-z])\(", r"logb(\1,", s)
+    s = re.sub(r"\blog(\d+)\(", r"logb(\1,", s)
+    # palabras pegadas: xsenx → x sen x ; pix → pi x
+    def _palabra(m):
+        w = m.group(0)
+        seg = _segmentar(w)
+        return " ".join(seg) if seg and len(seg) > 1 else w
+    s = re.sub(r"(?<![A-Za-z_])[A-Za-z]{2,}(?![A-Za-z_(])", _palabra, s)
+    s = re.sub(r"(?<![A-Za-z_])[A-Za-z]{2,}(?=\()", lambda m: (
+        " ".join(_segmentar(m.group(0))[:-1] + [_segmentar(m.group(0))[-1]])
+        if _segmentar(m.group(0)) and len(_segmentar(m.group(0))) > 1
+        and _segmentar(m.group(0))[-1] in _FUNCIONES else m.group(0)), s)
+    s = re.sub(r"\b(" + _FN_RE + r")(?=\d)", r"\1 ", s)       # sen2x → sen 2x
+    s = re.sub(r"(?<=[\d.])(?=[A-Za-z])", "*", s)              # 2x → 2*x
+    s = re.sub(r"(?<=[xyt])(?=\d)", "*", s)                    # x2 → x*2
+    # función sin paréntesis: sen x, cos x^2, sen 2x, sen^2 x
+    mono = (r"((?:[+-]?\d+(?:\.\d+)?)?\*?(?:pi|[xyte])?"
+            r"(?:\^[+-]?\d+(?:\.\d+)?)?)")
+    def _aplicar(m):
+        f, pot, arg = m.group(1), m.group(2) or "", m.group(3)
+        if not arg or arg in "+-":
+            return m.group(0)
+        return f"{f}{pot}({arg})"
+    s = re.sub(r"\b(" + _FN_RE + r")(\^\d+)?[ \t]+" + mono + r"(?![\w(.])",
+               _aplicar, s)
+    # paréntesis faltantes al final se cierran solos
+    falta = s.count("(") - s.count(")")
+    if falta < 0:
+        raise ValueError("Hay paréntesis de cierre de más ‹)›.")
+    s += ")" * falta
+    return s
 
 
 def parse_math(texto, vars_ok=(x,)):
@@ -49,21 +130,13 @@ def parse_math(texto, vars_ok=(x,)):
     s = (texto or "").strip()
     if not s:
         raise ValueError("Hay un campo vacío.")
-    s = (s.replace("−", "-").replace("·", "*").replace("×", "*")
-          .replace("π", "pi").replace("∞", "oo"))
-    s = re.sub(r"√\s*\(", "sqrt(", s)
-    s = re.sub(r"√\s*([A-Za-z0-9.]+)", r"sqrt(\1)", s)
-    if "__" in s or not _PERMITIDOS.match(s):
-        raise ValueError(f"Caracteres no permitidos en «{texto}».")
-    s = re.sub(r"(?<=\d),(?=\d)", ".", s)
-    s = re.sub(r"\blog_(\d+(?:\.\d+)?|[a-z])\(", r"logb(\1,", s)
-    s = re.sub(r"\blog(\d+)\(", r"logb(\1,", s)
+    s = _naturalizar(s)
     try:
         expr = parse_expr(s, local_dict=dict(_LOCALS), transformations=_TRANSF)
     except Exception as exc:  # noqa
         raise ValueError(
-            f"No pude interpretar «{texto}». Usá * entre factores y paréntesis "
-            f"en las funciones, por ejemplo sen(2*x). ({type(exc).__name__})")
+            f"No pude interpretar «{texto}». Revisá los paréntesis y los "
+            f"operadores, por ejemplo sen(2x)·cos(x). ({type(exc).__name__})")
     expr = sp.sympify(expr)
     extra = [str(v) for v in expr.free_symbols if v not in vars_ok]
     if extra:
@@ -906,6 +979,77 @@ def _linspace_seguro(a, b, n=1800):
     return np.linspace(float(a), float(b), n)
 
 
+# ---- Teclado virtual matemático (estilo GeoGebra) ---------------------------
+_TECLAS = [
+    [("√", "sqrt("), ("x²", "^2"), ("x³", "^3"), ("^", "^"), ("π", "pi"),
+     ("e", "e"), ("⌫", "<BORRAR>")],
+    [("sen()", "sen("), ("cos()", "cos("), ("ln()", "ln("), ("|x|", "abs("),
+     ("(", "("), (")", ")"), ("C", "<LIMPIAR>")],
+]
+_PREVIOS_OPERADOR = "+-*/^(=,"
+_TOKEN_FINAL = re.compile(r"(arcsen|arccos|arctg|sqrt|sen|cos|tg|ln|abs|exp)\($")
+
+
+def _unir(texto, ins):
+    """Concatena un símbolo al texto actual con criterio matemático."""
+    texto = texto or ""
+    if ins == "<LIMPIAR>":
+        return ""
+    if ins == "<BORRAR>":
+        m = _TOKEN_FINAL.search(texto)
+        return texto[:m.start()] if m else texto[:-1]
+    previo = texto.rstrip()[-1:]
+    if ins in ("^2", "^3"):
+        if previo == "" or previo in _PREVIOS_OPERADOR:
+            return texto + "x" + ins          # «y = » + x² → «y = x^2»
+        return texto + ins
+    if ins in ("pi", "e", "sqrt(", "sen(", "cos(", "ln(", "abs("):
+        if previo and (previo.isalnum() or previo in ")|"):
+            ins = "*" + ins                    # 2 + π → 2*pi
+    return texto + ins
+
+
+def _teclear(key, ins):
+    st.session_state[key] = _unir(st.session_state.get(key, ""), ins)
+
+
+def _boton_ancho(col, etiqueta, key, cb, args):
+    try:
+        col.button(etiqueta, key=key, on_click=cb, args=args,
+                   use_container_width=True)
+    except TypeError:  # versiones nuevas de Streamlit
+        col.button(etiqueta, key=key, on_click=cb, args=args, width="stretch")
+
+
+def campo(label, key, default="", **kw):
+    """text_input ligado a st.session_state[key] (lo usa el teclado virtual)."""
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.text_input(label, key=key, **kw)
+
+
+def teclado(destinos, clave):
+    """Teclado virtual. destinos: [(etiqueta, key_del_text_input), ...]."""
+    if len(destinos) > 1:
+        etiquetas = [d[0] for d in destinos]
+        sel = st.radio("⌨️ El teclado escribe en:", etiquetas, horizontal=True,
+                       key=f"kbd_sel_{clave}_{len(destinos)}")
+        key = destinos[etiquetas.index(sel)][1]
+    else:
+        key = destinos[0][1]
+    try:
+        caja = st.container(key=f"kbd_{clave}")
+    except TypeError:
+        caja = st.container()
+    with caja:
+        for fila, teclas in enumerate(_TECLAS):
+            cols = st.columns(len(teclas))
+            for j, (col, (etq, ins)) in enumerate(zip(cols, teclas)):
+                _boton_ancho(col, etq, f"kbd_{clave}_{fila}_{j}", _teclear,
+                             (key, ins))
+    st.caption("Los paréntesis que falten se cierran solos al calcular.")
+
+
 # ---- Módulo 1 ---------------------------------------------------------------
 _REGLAS_ES = {
     "URule": "sustitución (cambio de variable)",
@@ -973,7 +1117,8 @@ def calc_primitiva(txt):
 
 def ui_primitivas():
     st.markdown("Calculá la familia de primitivas $\\int f(x)\\,dx = F(x)+C$.")
-    txt = st.text_input("f(x) =", "x*arctg(x)/(1+x^2)^2", key="m1_f")
+    txt = campo("f(x) =", "m1_f", "x*arctg(x)/(1+x^2)^2")
+    teclado([("f(x)", "m1_f")], "m1")
     if st.button("Calcular primitiva", key="m1_btn", type="primary"):
         try:
             _estado("m1_res", calc_primitiva(txt))
@@ -1044,7 +1189,8 @@ def calc_pvi(txt, x0t, y0t, xmin, xmax):
 def ui_pvi():
     st.markdown("Hallá la curva $f(x)$ tal que $f'(x)$ es la función dada y "
                 "pasa por $P(x_0,y_0)$.")
-    txt = st.text_input("f'(x) =", "x*2^x", key="m2_f")
+    txt = campo("f'(x) =", "m2_f", "x*2^x")
+    teclado([("f'(x)", "m2_f")], "m2")
     c1, c2, c3 = st.columns(3)
     x0t = c1.text_input("x₀", "0", key="m2_x0")
     y0t = c2.text_input("y₀", "3/ln(2)^2", key="m2_y0")
@@ -1170,8 +1316,10 @@ def ui_tfc():
     c1, c2 = st.columns(2)
     a_t = c1.text_input("Límite inferior a(x)", "1", key="m3_a")
     b_t = c2.text_input("Límite superior b(x)", "e^(2*x)", key="m3_b")
-    f_t = st.text_input("Integrando f(t)  (puede incluir x como parámetro)",
-                        "5*(x+3)/(t^4+7)", key="m3_f")
+    f_t = campo("Integrando f(t)  (puede incluir x como parámetro)", "m3_f",
+                "5*(x+3)/(t^4+7)")
+    teclado([("f(t)", "m3_f"), ("b(x)", "m3_b"), ("a(x)", "m3_a"),
+             ("u(x)", "m3_u")], "m3")
     c3, c4 = st.columns(2)
     u_t = c3.text_input("Factor externo u(x) (opcional)", "1", key="m3_u")
     x0_t = c4.text_input("Evaluar Φ'(x₀) en x₀ (opcional)", "0", key="m3_x0")
@@ -1244,7 +1392,8 @@ def calc_definida(f_t, a_t, b_t):
 def ui_definidas():
     st.markdown("Calculá $\\int_a^b f(x)\\,dx$ con la Regla de Barrow y "
                 "visualizá el área.")
-    f_t = st.text_input("f(x) =", "x*sen(x)", key="m4_f")
+    f_t = campo("f(x) =", "m4_f", "x*sen(x)")
+    teclado([("f(x)", "m4_f"), ("a", "m4_a"), ("b", "m4_b")], "m4")
     c1, c2 = st.columns(2)
     a_t = c1.text_input("a", "0", key="m4_a")
     b_t = c2.text_input("b", "pi", key="m4_b")
@@ -1354,6 +1503,8 @@ def entrada_curvas(prefix, ejemplos, cb=None):
               args=(prefix,))
     c2.button("➖ Quitar última", key=prefix + "_menos", on_click=_menos,
               args=(prefix,))
+    teclado([(f"Ec. {i + 1}", f"{prefix}_c{i}")
+             for i in range(st.session_state[prefix + "_n"])], prefix)
     return textos
 
 
@@ -1595,7 +1746,8 @@ def ui_longitud():
     st.markdown("Longitud del arco de una curva en un intervalo.")
     tipo = st.radio("Tipo de curva", ["y = f(x)", "x = g(y)"], horizontal=True,
                     key="m6_tipo")
-    f_t = st.text_input("Función", "x^(3/2) + 10", key="m6_f")
+    f_t = campo("Función", "m6_f", "x^(3/2) + 10")
+    teclado([("Función", "m6_f"), ("a", "m6_a"), ("b", "m6_b")], "m6")
     c1, c2 = st.columns(2)
     a_t = c1.text_input("a", "4/3", key="m6_a")
     b_t = c2.text_input("b", "32/9", key="m6_b")
@@ -1673,14 +1825,47 @@ def tramo_volumen(tr, var, c):
     return Rext, Rint, sp.simplify(Rext ** 2 - Rint ** 2), ""
 
 
+# --- estética 3D "premium" ---------------------------------------------------
+LUCES_3D = dict(ambient=0.6, diffuse=0.8, roughness=0.1, specular=1.0,
+                fresnel=0.2)
+POSICION_LUZ = dict(x=200, y=300, z=400)
+ESCALA_EXTERIOR = [[0.0, "#0b3c8c"], [0.35, "#1f78d1"], [0.7, "#6cb8f0"],
+                   [1.0, "#d9f0ff"]]
+ESCALA_INTERIOR = [[0.0, "#0a2540"], [0.4, "#2a8fbd"], [0.75, "#7fd6ea"],
+                   [1.0, "#eafcff"]]
+ESCALA_TAPA = [[0.0, "#1565c0"], [1.0, "#bfe4ff"]]
+N_MALLA = 200  # densidad de la malla (puntos por dirección)
+
+
+def _escena_limpia(titulo):
+    """Layout 3D sin ejes ni paneles, al estilo de un software matemático."""
+    oculto = dict(visible=False)
+    return dict(
+        height=560, margin=dict(l=0, r=0, t=36, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        title=dict(text=titulo, font=dict(size=14)),
+        scene=dict(aspectmode="data", xaxis=oculto, yaxis=oculto, zaxis=oculto,
+                   bgcolor="rgba(0,0,0,0)",
+                   camera=dict(eye=dict(x=1.45, y=1.35, z=0.95))),
+        showlegend=False)
+
+
+def _superficie3d(fig, X, Yv, Z, color, escala, cmin, cmax, opacidad=1.0):
+    """Superficie suave con iluminación realista y degradado de color."""
+    fig.add_trace(go.Surface(
+        x=np.round(X, 5), y=np.round(Yv, 5), z=np.round(Z, 5),
+        surfacecolor=np.round(color, 5), colorscale=escala, cmin=cmin,
+        cmax=cmax, showscale=False, opacity=opacidad,
+        lighting=LUCES_3D, lightposition=POSICION_LUZ,
+        hoverinfo="skip", name=""))
+
+
 def fig_3d(motor, r, eje, sel, ang):
     tipo, c = eje
     cf = float(sp.N(c))
     fig = go.Figure()
-    th = np.linspace(0, np.deg2rad(ang), 70)
+    th = np.linspace(0, np.deg2rad(ang), N_MALLA)
     dx = r["modo"] == "dx"
-    xmin = ymin = np.inf
-    xmax = ymax = -np.inf
 
     def revolver(s, R):
         if tipo == "h":
@@ -1693,29 +1878,30 @@ def fig_3d(motor, r, eje, sel, ang):
         Z = R[:, None] * np.sin(th)[None, :]
         return X, Yv, Z
 
-    def superficie(X, Yv, Z, col, nombre, op=0.85):
-        fig.add_trace(go.Surface(
-            x=X, y=Yv, z=Z, showscale=False, opacity=op, name=nombre,
-            colorscale=[[0, col], [1, col]], showlegend=False, hoverinfo="skip"))
-
-    for tr in r["tramos"]:
-        if tr["cara"] not in sel:
-            continue
-        s = np.linspace(tr["fa"], tr["fb"], 140)
+    tramos = [tr for tr in r["tramos"] if tr["cara"] in sel]
+    cmin = min((tr["fa"] for tr in tramos), default=0.0)
+    cmax = max((tr["fb"] for tr in tramos), default=1.0)
+    if cmax - cmin < 1e-12:
+        cmax = cmin + 1.0
+    for tr in tramos:
+        s = np.linspace(tr["fa"], tr["fb"], N_MALLA)
         vh = (tr["hi"][0].ev_y(tr["hi"][1], s) if dx else tr["hi"][0].ev_x(tr["hi"][1], s))
         vl = (tr["lo"][0].ev_y(tr["lo"][1], s) if dx else tr["lo"][0].ev_x(tr["lo"][1], s))
         ok = np.isfinite(vh) & np.isfinite(vl)
         s, vh, vl = s[ok], vh[ok], vl[ok]
         if s.size < 3:
             continue
-        for vals, col in ((vh, "#1f77b4"), (vl, "#ff7f0e")):
-            superficie(*revolver(s, vals - cf), col, "frontera")
+        col = np.broadcast_to(s[:, None], (s.size, th.size))
+        for vals, escala in ((vh, ESCALA_EXTERIOR), (vl, ESCALA_INTERIOR)):
+            _superficie3d(fig, *revolver(s, vals - cf), col, escala, cmin, cmax)
         for idx in (0, -1):  # tapas (arandelas) en los extremos del tramo
-            rr = np.linspace(vl[idx] - cf, vh[idx] - cf, 10)
+            rr = np.linspace(vl[idx] - cf, vh[idx] - cf, 40)
             if abs(rr[0] - rr[-1]) < 1e-12:
                 continue
             sv = np.full(rr.shape, s[idx])
-            superficie(*revolver(sv, rr), "#2ca02c", "tapa", op=0.7)
+            colt = np.broadcast_to(rr[:, None], (rr.size, th.size))
+            _superficie3d(fig, *revolver(sv, rr), colt, ESCALA_TAPA,
+                          float(rr.min()), float(rr.max()) + 1e-9)
     # eje de giro
     X0, X1, Y0, Y1 = motor.caja
     if tipo == "h":
@@ -1723,12 +1909,9 @@ def fig_3d(motor, r, eje, sel, ang):
     else:
         ex, ey = [cf, cf], [Y0, Y1]
     fig.add_trace(go.Scatter3d(x=ex, y=ey, z=[0, 0], mode="lines",
-                               line=dict(color="black", width=6), name="eje de giro"))
-    fig.update_layout(height=520, margin=dict(l=0, r=0, t=30, b=0),
-                      scene=dict(aspectmode="data", xaxis_title="x",
-                                 yaxis_title="y", zaxis_title="z"),
-                      title=dict(text="Sólido de revolución (3D interactivo)",
-                                 font=dict(size=14)))
+                               line=dict(color="#222", width=5, dash="dash"),
+                               hoverinfo="skip", name="eje de giro"))
+    fig.update_layout(**_escena_limpia("Sólido de revolución (3D interactivo)"))
     return fig
 
 
@@ -1852,29 +2035,32 @@ def calc_superficie(tipo_c, f_t, a_t, b_t, eje_t):
         aviso = "La curva cruza el eje de giro: se usa |radio|."
     integrando = sp.simplify(r_eff * ds)
     res = integrar_definida(integrando, var, a, b)
-    # 3D
-    g = np.linspace(am, bm, 160)
+    # 3D (malla densa y suave)
+    g = np.linspace(am, bm, N_MALLA)
     fn = num_fn(f, var)
     vals = fn(g)
     xs_, ys_ = (g, vals) if var == x else (vals, g)
-    th = np.linspace(0, 2 * np.pi, 80)
+    th = np.linspace(0, 2 * np.pi, N_MALLA)
     cf = float(sp.N(eje[1]))
     if eje[0] == "h":
         R = ys_ - cf
         X = xs_[:, None] * np.ones_like(th)[None, :]
         Yv = cf + R[:, None] * np.cos(th)[None, :]
         Z = R[:, None] * np.sin(th)[None, :]
+        param = xs_
     else:
         R = xs_ - cf
         X = cf + R[:, None] * np.cos(th)[None, :]
         Yv = ys_[:, None] * np.ones_like(th)[None, :]
         Z = R[:, None] * np.sin(th)[None, :]
-    fig = go.Figure(go.Surface(x=X, y=Yv, z=Z, showscale=False, opacity=0.9,
-                               colorscale="Viridis"))
-    fig.update_layout(height=500, margin=dict(l=0, r=0, t=30, b=0),
-                      scene=dict(aspectmode="data"),
-                      title=dict(text="Superficie de revolución (3D)",
-                                 font=dict(size=14)))
+        param = ys_
+    fig = go.Figure()
+    pf = param[np.isfinite(param)]
+    color = np.broadcast_to(np.nan_to_num(param)[:, None], X.shape)
+    _superficie3d(fig, X, Yv, Z, color, ESCALA_EXTERIOR,
+                  float(pf.min()) if pf.size else 0.0,
+                  float(pf.max()) + 1e-9 if pf.size else 1.0)
+    fig.update_layout(**_escena_limpia("Superficie de revolución (3D)"))
     return {"var": var, "ds": ds, "radio": radio, "r_eff": r_eff,
             "integrando": integrando, "res": res, "a": a, "b": b,
             "aviso": aviso, "fig": fig, "tipo": eje[0]}
@@ -1885,7 +2071,8 @@ def _ui_superficie():
                 "giro y $ds=\\sqrt{1+(f')^2}\\,dx$.")
     tipo_c = st.radio("Tipo de curva", ["y = f(x)", "x = g(y)"], horizontal=True,
                       key="m7s_tipo")
-    f_t = st.text_input("Función", "4*sqrt(x)", key="m7s_f")
+    f_t = campo("Función", "m7s_f", "4*sqrt(x)")
+    teclado([("Función", "m7s_f"), ("a", "m7s_a"), ("b", "m7s_b")], "m7s")
     c1, c2, c3 = st.columns(3)
     a_t = c1.text_input("a", "5", key="m7s_a")
     b_t = c2.text_input("b", "21", key="m7s_b")
@@ -1966,7 +2153,8 @@ def calc_promedio(f_t, a_t, b_t):
 def ui_promedio():
     st.markdown("$f_{prom}=\\dfrac{1}{b-a}\\int_a^b f(x)\\,dx$ y el "
                 "punto $c$ del Teorema del Valor Medio.")
-    f_t = st.text_input("f(x) =", "x/(3*x+2)^(1/3)", key="m8_f")
+    f_t = campo("f(x) =", "m8_f", "x/(3*x+2)^(1/3)")
+    teclado([("f(x)", "m8_f"), ("a", "m8_a"), ("b", "m8_b")], "m8")
     c1, c2 = st.columns(2)
     a_t = c1.text_input("a", "-1/3", key="m8_a")
     b_t = c2.text_input("b", "2", key="m8_b")
@@ -2161,7 +2349,8 @@ def calc_limite(f_t, c_t, dir_t):
 def ui_limites():
     st.markdown("Resolvé $\\lim_{x\\to c} f(x)$ mostrando el camino: forma "
                 "indeterminada, salvataje algebraico, L'Hôpital o logaritmo.")
-    f_t = st.text_input("f(x) =", "(1+2/x)^(5*x)", key="m9_f")
+    f_t = campo("f(x) =", "m9_f", "(1+2/x)^(5*x)")
+    teclado([("f(x)", "m9_f"), ("c", "m9_c")], "m9")
     c1, c2 = st.columns(2)
     c_t = c1.text_input("x → c   (c puede ser oo, -oo, pi, 2…)", "oo", key="m9_c")
     dir_t = c2.selectbox("Dirección", list(_DIRS.keys()), key="m9_d")
@@ -2204,111 +2393,177 @@ def ui_limites():
 # ----------------------------------------------------------------------------
 # 6. MARCO TEÓRICO (síntesis del material de la cátedra) E INTERFAZ PRINCIPAL
 # ----------------------------------------------------------------------------
+# Cada módulo es una lista de bloques:
+#   ("def", título, texto)          → cuadro azul (definición / teorema)
+#   ("form", [LaTeX, ...])          → fórmulas centradas, con aire alrededor
+#   ("lista", título, [ítems])      → propiedades en viñetas
+#   ("pasos", título, [ítems])      → procedimiento numerado
+#   ("truco", texto)                → cuadro verde (truco de la cátedra)
+#   ("estrategia", texto)           → cuadro amarillo (estrategia / cuidado)
 TEORIA = {
-1: r"""
-**Primitiva e integral indefinida.** $F$ es *primitiva* de $f$ en un intervalo $I$ si $F'(x)=f(x)$ para todo $x\in I$. Dos primitivas de la misma función difieren en una constante, por eso $\int f(x)\,dx=F(x)+C$ representa una **familia de curvas**.
-
-- *Hallar todas* las primitivas: se deja $+C$. *Hallar una* primitiva: se fija un valor (por ejemplo $C=0$).
-- **Integrar y derivar son operaciones inversas:** $\frac{d}{dx}\!\int f(x)\,dx=f(x)$ y $\int F'(x)\,dx=F(x)+C$.
-- **Reglas básicas:** $\int x^n\,dx=\frac{x^{n+1}}{n+1}+C$ $(n\ne-1)$; $\int\frac{dx}{x}=\ln|x|+C$; linealidad $\int(\alpha f\pm\beta g)=\alpha\!\int f\pm\beta\!\int g$.
-- **Inmediatas:** $\int e^{ax+b}dx=\frac{e^{ax+b}}{a}+C$; $\int a^x dx=\frac{a^x}{\ln a}+C$; $\int\cos=\operatorname{sen}$; $\int\operatorname{sen}=-\cos$; $\int\sec^2=\operatorname{tg}$; $\int\frac{dx}{1+x^2}=\operatorname{arctg}x$; $\int\frac{dx}{\sqrt{1-x^2}}=\operatorname{arcsen}x$.
-- **Identidades útiles:** $\operatorname{sen}^2\alpha=\frac{1-\cos2\alpha}{2}$, $\cos^2\alpha=\frac{1+\cos2\alpha}{2}$, $1+\operatorname{tg}^2=\sec^2$, $1+\operatorname{cotg}^2=\operatorname{cosec}^2$. Para $\operatorname{sen}^3$ o $\cos^3$ (potencia impar): separar una unidad y usar $\operatorname{sen}^2=1-\cos^2$.
-- **Sustitución:** si $F$ es primitiva de $f$, entonces $F(g(x))$ es primitiva de $f(g(x))\,g'(x)$. Se elige $u=g(x)$ y se reemplaza **todo** el integrando (incluido $dx$).
-- **Por partes:** $\int u\,dv=uv-\int v\,du$. Se elige $u$ siguiendo el orden ILATE (inversas, logarítmicas, algebraicas, trigonométricas, exponenciales).
-- **Criterio de la cátedra:** *acomodo e integro*: primero se acomoda el integrando (completar cuadrados, fracciones simples, identidades) y recién después se integra.
-""",
-2: r"""
-**Problema de valor inicial.** Dada $f'(x)$ y un punto $P(x_0,y_0)$ de la gráfica de $f$:
-
-1. Se integra: $f(x)=F(x)+C$ (familia de curvas que difieren en una constante vertical).
-2. Se impone la condición: $f(x_0)=y_0\;\Rightarrow\;C=y_0-F(x_0)$.
-3. Se escribe la curva **particular**: $f(x)=F(x)+C$.
-
-- Si se conoce $f''$ se integra **dos veces** y se necesitan **dos** condiciones (por ejemplo $f'(x_1)$ y $f(x_0)$): primero se halla $f'$, se fija su constante y luego se integra $f'$.
-- **Cinemática:** $v=s'$, $a=v'$. Dada la velocidad, la posición es $s(t)=\int v\,dt$ con $s(0)$ como condición inicial.
-- **Razones de cambio:** si $\frac{dr}{dt}=g(t)$, la ley temporal es $r(t)=\int g\,dt$ con el dato inicial (o en un instante dado) del problema.
-- Siempre conviene **verificar** derivando que $f'$ coincide con el dato y que la curva pasa por $P$.
-""",
-3: r"""
-**Teorema Fundamental del Cálculo (TFC).** Si $f$ es continua en $[a,b]$ y $F(x)=\int_a^x f(t)\,dt$, entonces $F$ es derivable y $F'(x)=f(x)$ para todo $x\in[a,b]$.
-
-**Con regla de la cadena:** $\dfrac{d}{dx}\displaystyle\int_{a(x)}^{b(x)} f(t)\,dt=f\big(b(x)\big)\,b'(x)-f\big(a(x)\big)\,a'(x)$.
-
-- **Acomodo antes de derivar:** la variable debe estar en el límite *superior*; si está en el inferior se invierte con $\int_a^b=-\int_b^a$. Con dos límites funcionales se parte por una constante $c$: $\int_{a(x)}^{b(x)}=-\int_c^{a(x)}+\int_c^{b(x)}$.
-- **Límites constantes:** si ambos límites son constantes la integral es un **número** y su derivada es $0$.
-- **Ya no se integra:** el TFC reemplaza al cálculo de la primitiva; basta evaluar el integrando en los límites y multiplicar por la derivada de cada límite.
-- **Constantes y factores:** una constante sumada se anula al derivar; si hay un factor $u(x)$ delante de la integral se usa la regla del producto.
-- **Truco de paridad:** con límites simétricos $[-a,a]$ e integrando impar la integral vale $0$ (útil para evaluar $G(2)$ en funciones definidas por integrales).
-- Si el integrando depende de $x$ además de $t$, se agrega $\int\frac{\partial f}{\partial x}dt$ (regla de Leibniz).
-""",
-4: r"""
-**Regla de Barrow.** Si $f$ es continua en $[a,b]$ y $G$ es **cualquier** primitiva de $f$: $\displaystyle\int_a^b f(x)\,dx=G(b)-G(a)=\big[G(x)\big]_a^b$.
-
-- **Propiedades:** linealidad; $\int_a^a f=0$; $\int_a^b f=-\int_b^a f$; aditividad $\int_a^b f=\int_a^c f+\int_c^b f$.
-- **Monotonía:** si $f\le g$ en $[a,b]$ entonces $\int_a^b f\le\int_a^b g$; además $\big|\int_a^b f\big|\le\int_a^b|f|$.
-- **Cambio de variable:** o se mantiene la variable original (se vuelve a $x$ antes de evaluar) o se **cambian los límites** a los valores de $u=g(x)$.
-- **Simetría:** si $f$ es **par**, $\int_{-a}^a f=2\int_0^a f$; si es **impar**, $\int_{-a}^a f=0$.
-- **Integral neta vs. área:** $\int_a^b f$ resta las zonas donde $f<0$. El área geométrica es $\int_a^b|f|$: se parte el intervalo en las raíces de $f$.
-- **Parámetros:** en ecuaciones como $\int_{a}^{b} k\ln(3t)\,dt=9$ se calcula la integral en función del parámetro y se despeja.
-""",
-5: r"""
-**Área entre curvas.** Se grafica siempre primero. Hay dos formas de cortar la región:
-
-- **Rectángulos paralelos al eje $y$ ($dx$):** curvas como $y=f(x)$.
-  $A=\displaystyle\int_a^b\big[\text{(arriba)}-\text{(abajo)}\big]\,dx$.
-- **Rectángulos paralelos al eje $x$ ($dy$):** curvas como $x=g(y)$ (se despeja $x$).
-  $A=\displaystyle\int_c^d\big[\text{(derecha)}-\text{(izquierda)}\big]\,dy$.
-
-- **Puntos angulosos:** si en el recinto cambia el «techo» o el «piso» (la curva superior o inferior es otra) la región **se parte** en dos o más integrales: $A=\int_a^b+\int_b^c$.
-- **Elección del corte:** se prefiere el que **no obliga a partir** la región o el que permite integrar con menos trabajo (a veces $dy$ evita un cambio de techo).
-- Los límites de integración son las **abscisas (u ordenadas) de las intersecciones**: se igualan las curvas y se resuelve; se verifican en ambas ecuaciones.
-- Cada integrando es positivo (arriba − abajo). Con funciones que cambian de signo el área es $\int|f|$.
-""",
-6: r"""
-**Longitud de arco.** Si $f$ tiene derivada continua en $[a,b]$:
-$$L=\int_a^b\sqrt{1+\big[f'(x)\big]^2}\,dx.$$
-Si la curva es $x=g(y)$ con $g'$ continua en $[c,d]$: $L=\int_c^d\sqrt{1+\big[g'(y)\big]^2}\,dy$.
-
-- **Estrategia:** derivar, elevar al cuadrado, sumar $1$ y **simplificar**: en los ejercicios de parcial el radicando casi siempre es un **cuadrado perfecto** (o permite una sustitución directa).
-- $\sqrt{h^2}=|h|$: hay que analizar el signo de $h$ en el intervalo antes de quitar el módulo.
-- La longitud depende sólo de la curva, no de cómo se la recorra: $L>0$.
-- Con expresiones del tipo $\big(x^{3/2}\big)'=\tfrac32x^{1/2}$ conviene factorizar para llegar a $u=1+\tfrac94x$ (sustitución lineal).
-""",
-7: r"""
-**Sólidos de revolución — fórmula general.** Al girar una región $R$ alrededor de un eje, cada corte perpendicular al eje es un **disco** o una **arandela** de área $A=\pi\big(R_{ext}^2-R_{int}^2\big)$, donde cada radio es la **distancia de la curva al eje**.
-
-- **Eje horizontal $y=c$** $\Rightarrow$ cortes verticales $\Rightarrow$ se integra en $dx$:
-  $V=\pi\displaystyle\int_a^b\Big(\big[f_{ext}(x)-c\big]^2-\big[f_{int}(x)-c\big]^2\Big)dx$.
-- **Eje vertical $x=c$** $\Rightarrow$ cortes horizontales $\Rightarrow$ se integra en $dy$ con las funciones **inversas** $x=g(y)$:
-  $V=\pi\displaystyle\int_c^d\Big(\big[g_{ext}(y)-c\big]^2-\big[g_{int}(y)-c\big]^2\Big)dy$.
-- **Radio exterior** es el borde más lejano al eje, **interior** el más cercano. El eje **no debe atravesar** la región; si coincide con un borde, ese radio es $0$ (disco).
-- **Puntos angulosos:** si cambia el borde exterior o interior, el volumen se parte en varias integrales.
-- **Área de superficie de revolución:** $S=2\pi\displaystyle\int r\,ds$, con $r$ la distancia al eje y $ds=\sqrt{1+[f'(x)]^2}\,dx$.
-- Graficar la región y marcar el eje es **obligatorio** antes de plantear.
-""",
-8: r"""
-**Valor promedio.** Si $f$ es continua en $[a,b]$: $f_{prom}=\dfrac{1}{b-a}\displaystyle\int_a^b f(x)\,dx$.
-
-**Teorema del Valor Medio del Cálculo Integral.** Si $f$ es continua en $[a,b]$ existe $c\in[a,b]$ tal que
-$$f(c)=\frac{1}{b-a}\int_a^b f(x)\,dx,\qquad\text{es decir}\qquad \int_a^b f=f(c)\,(b-a).$$
-
-- **Interpretación geométrica:** el área bajo $f$ coincide con el área del **rectángulo** de base $(b-a)$ y altura $f_{prom}$.
-- **Cómo hallar $c$:** se resuelve $f(x)=f_{prom}$ y se conservan las soluciones que pertenecen a $[a,b]$ (puede haber más de una).
-- **Problemas con parámetro:** si el dato es el valor promedio (por ejemplo «es igual a $\frac{\pi}{8b+40}$») se plantea la igualdad y se despeja el extremo o el parámetro.
-- La demostración usa el Teorema de Weierstrass (máximo y mínimo) y el de los valores intermedios para una función continua.
-""",
-9: r"""
-**Indeterminaciones y L'Hôpital.**
-
-- **Formas:** $\frac00,\ \frac\infty\infty,\ 0\cdot\infty,\ \infty-\infty$ y las potencias $1^\infty,\ 0^0,\ \infty^0$.
-- **Salvataje algebraico primero:** factorizar y simplificar, racionalizar con el conjugado, denominador común, dividir por la mayor potencia.
-- **Regla de L'Hôpital:** si $\frac{f}{g}$ es $\frac00$ o $\frac\infty\infty$ y existe $\lim\frac{f'}{g'}$ (finito o infinito), entonces $\lim\frac fg=\lim\frac{f'}{g'}$. Se **deriva numerador y denominador por separado** (no es la derivada del cociente) y puede repetirse.
-- **Producto $0\cdot\infty$:** se transforma en cociente, $f\cdot g=\dfrac{g}{1/f}$, para llegar a $\frac00$ o $\frac\infty\infty$.
-- **Protocolo para potencias** $y=f^g$ ($1^\infty,0^0,\infty^0$): se toma logaritmo $\ln y=g\cdot\ln f$, se calcula $L=\lim\ln y$ (queda $0\cdot\infty$ → cociente → L'Hôpital) y se concluye $\lim y=e^{L}$.
-- **Límite notable:** $\lim_{x\to\infty}\left(1+\frac kx\right)^{mx}=e^{km}$.
-- **Con el TFC:** $\lim\frac{\int_0^{u(x)}f}{g(x)}$ de la forma $\frac00$ se resuelve con L'Hôpital derivando la integral con el TFC.
-- **Convergencia:** una exponencial crece más rápido que cualquier potencia y una potencia más rápido que $\ln$: $\lim\frac{\ln x}{x^p}=0$, $\lim\frac{x^p}{e^x}=0$.
-""",
+1: [
+ ("def", "Primitiva e integral indefinida",
+  r"$F$ es **primitiva** de $f$ en un intervalo $I$ si $F'(x)=f(x)$ para todo $x\in I$. "
+  r"Dos primitivas de la misma función difieren en una constante, por eso la integral "
+  r"indefinida es una **familia de curvas**."),
+ ("form", [r"\displaystyle \int f(x)\,dx \;=\; F(x)+C",
+           r"\displaystyle \frac{d}{dx}\!\left[\int f(x)\,dx\right]=f(x)"
+           r"\qquad\qquad \int F'(x)\,dx=F(x)+C"]),
+ ("estrategia", r"*Hallar todas* las primitivas: se deja $+C$. *Hallar una* primitiva: "
+  r"se fija un valor (por ejemplo $C=0$) y se la nombra $F(x)$."),
+ ("lista", "Reglas básicas e inmediatas", [
+  r"**Potencia:** $\int x^n\,dx=\dfrac{x^{n+1}}{n+1}+C$ con $n\neq-1$; y $\int\dfrac{dx}{x}=\ln|x|+C$.",
+  r"**Linealidad:** $\int(\alpha f\pm\beta g)\,dx=\alpha\!\int f\,dx\pm\beta\!\int g\,dx$.",
+  r"**Exponenciales:** $\int e^{ax+b}dx=\dfrac{e^{ax+b}}{a}+C$ y $\int a^x\,dx=\dfrac{a^x}{\ln a}+C$.",
+  r"**Trigonométricas:** $\int\cos=\operatorname{sen}$, $\int\operatorname{sen}=-\cos$, "
+  r"$\int\sec^2=\operatorname{tg}$, $\int\dfrac{dx}{1+x^2}=\operatorname{arctg}x$, "
+  r"$\int\dfrac{dx}{\sqrt{1-x^2}}=\operatorname{arcsen}x$."]),
+ ("truco", r"Identidades que salvan el ejercicio: $\operatorname{sen}^2\alpha=\frac{1-\cos2\alpha}{2}$, "
+  r"$\cos^2\alpha=\frac{1+\cos2\alpha}{2}$, $1+\operatorname{tg}^2=\sec^2$. Con potencias "
+  r"**impares** ($\operatorname{sen}^3$, $\cos^3$) se separa una unidad y se usa "
+  r"$\operatorname{sen}^2=1-\cos^2$."),
+ ("def", "Método de sustitución",
+  r"Si $F$ es primitiva de $f$, entonces $F(g(x))$ es primitiva de $f(g(x))\,g'(x)$."),
+ ("form", [r"\displaystyle \int f\big(g(x)\big)\,g'(x)\,dx \;=\; \int f(u)\,du\Big|_{u=g(x)}"]),
+ ("estrategia", r"Se reemplaza **todo** el integrando (incluido $dx$) y recién al final se "
+  r"vuelve a la variable $x$."),
+ ("def", "Integración por partes", r"Sale de la regla del producto:"),
+ ("form", [r"\displaystyle \int u\,dv \;=\; u\,v-\int v\,du"]),
+ ("truco", r"Elegí $u$ con el orden **ILATE**: Inversas, Logarítmicas, Algebraicas, "
+  r"Trigonométricas, Exponenciales. Regla de oro de la cátedra: **acomodo e integro**; "
+  r"primero se acomoda el integrando (completar cuadrados, fracciones simples, identidades)."),
+],
+2: [
+ ("def", "Problema de valor inicial (PVI)",
+  r"Dada $f'(x)$ y un punto $P(x_0,y_0)$ de la gráfica de $f$, se busca la **única** curva "
+  r"de la familia de primitivas que pasa por $P$."),
+ ("pasos", "Procedimiento", [
+  r"**Integrar:** $f(x)=F(x)+C$ (curvas que difieren en una constante vertical).",
+  r"**Imponer la condición:** $f(x_0)=y_0$.",
+  r"**Despejar** la constante y escribir la curva particular."]),
+ ("form", [r"\displaystyle C \;=\; y_0-F(x_0)\qquad\Longrightarrow\qquad f(x)=F(x)+y_0-F(x_0)"]),
+ ("lista", "Variantes frecuentes", [
+  r"**Segunda derivada:** si se conoce $f''$ se integra **dos veces** y hacen falta **dos** "
+  r"condiciones (por ejemplo $f'(x_1)$ y $f(x_0)$).",
+  r"**Cinemática:** $v=s'$ y $a=v'$; dada la velocidad, $s(t)=\int v\,dt$ con $s(0)$ como dato.",
+  r"**Razones de cambio:** si $\dfrac{dr}{dt}=g(t)$, la ley temporal es $r(t)=\int g\,dt$ con el dato inicial."]),
+ ("truco", r"Verificá siempre: derivá el resultado y chequeá que la curva **pasa por $P$**."),
+],
+3: [
+ ("def", "Teorema Fundamental del Cálculo (TFC)",
+  r"Si $f$ es continua en $[a,b]$ y $F(x)=\int_a^x f(t)\,dt$, entonces $F$ es derivable y $F'(x)=f(x)$."),
+ ("form", [r"\displaystyle \frac{d}{dx}\int_{a}^{x} f(t)\,dt \;=\; f(x)",
+           r"\displaystyle \frac{d}{dx}\int_{a(x)}^{b(x)} f(t)\,dt \;=\; f\big(b(x)\big)\,b'(x)\;-\;f\big(a(x)\big)\,a'(x)"]),
+ ("truco", r"**Acomodo antes de derivar.** La variable tiene que estar en el límite *superior*: "
+  r"si está abajo se invierte $\int_a^b=-\int_b^a$. Con dos límites funcionales se parte por una "
+  r"constante $c$: $\int_{a(x)}^{b(x)}=-\int_c^{a(x)}+\int_c^{b(x)}$."),
+ ("lista", "Qué recordar", [
+  r"**Límites constantes:** la integral es un **número** y su derivada vale $0$.",
+  r"**Ya no se integra:** el TFC reemplaza al cálculo de la primitiva; se evalúa el integrando en los límites "
+  r"y se multiplica por la derivada de cada límite.",
+  r"**Factor delante** de la integral: regla del producto, $\big[u(x)\,I(x)\big]'=u'I+uI'$.",
+  r"**Constantes sumadas** se anulan al derivar."]),
+ ("truco", r"**Paridad:** con límites simétricos $[-a,a]$ e integrando **impar** la integral "
+  r"vale $0$; sirve para evaluar $G(2)$ en funciones definidas por integrales."),
+ ("def", "Regla de Leibniz (si el integrando también depende de $x$)",
+  r"Se suma la integral de la derivada parcial:"),
+ ("form", [r"\displaystyle \Phi'(x)=f(b,x)\,b'-f(a,x)\,a'+\int_{a(x)}^{b(x)}\frac{\partial f}{\partial x}(t,x)\,dt"]),
+],
+4: [
+ ("def", "Regla de Barrow",
+  r"Si $f$ es continua en $[a,b]$ y $G$ es **cualquier** primitiva de $f$:"),
+ ("form", [r"\displaystyle \int_a^b f(x)\,dx \;=\; G(b)-G(a) \;=\; \Big[G(x)\Big]_a^b"]),
+ ("lista", "Propiedades", [
+  r"**Linealidad** y $\int_a^a f=0$, $\int_a^b f=-\int_b^a f$.",
+  r"**Aditividad:** $\int_a^b f=\int_a^c f+\int_c^b f$.",
+  r"**Monotonía:** si $f\le g$ en $[a,b]$ entonces $\int_a^b f\le\int_a^b g$; además $\big|\int_a^b f\big|\le\int_a^b|f|$.",
+  r"**Simetría:** $f$ par $\Rightarrow\int_{-a}^a f=2\int_0^a f$; $f$ impar $\Rightarrow\int_{-a}^a f=0$."]),
+ ("truco", r"**Cambio de variable:** o se mantiene la variable original (se vuelve a $x$ antes de evaluar) "
+  r"o se **cambian los límites** a los valores de $u=g(x)$."),
+ ("estrategia", r"**Integral neta vs. área.** $\int_a^b f$ resta las zonas donde $f<0$; el área geométrica es "
+  r"$\int_a^b|f|$ y se obtiene partiendo el intervalo en las raíces de $f$."),
+ ("lista", "Problemas con parámetro", [
+  r"En igualdades como $\int_{1/3}^{e/3}k\ln(3t)\,dt=9$ se calcula la integral **en función del parámetro** y luego se despeja."]),
+],
+5: [
+ ("def", "Área entre curvas",
+  r"Se **grafica siempre primero**. La región se puede cortar de dos formas:"),
+ ("form", [r"\displaystyle A=\int_a^b\Big[\text{(arriba)}-\text{(abajo)}\Big]\,dx"
+           r"\qquad\text{(rectángulos paralelos al eje } y\text{)}",
+           r"\displaystyle A=\int_c^d\Big[\text{(derecha)}-\text{(izquierda)}\Big]\,dy"
+           r"\qquad\text{(rectángulos paralelos al eje } x\text{)}"]),
+ ("truco", r"**Puntos angulosos:** si dentro del recinto cambia el «techo» o el «piso» (la curva superior o "
+  r"inferior pasa a ser otra), la región **se parte** en dos o más integrales: $A=\int_a^b+\int_b^c$."),
+ ("estrategia", r"**Elección del corte:** conviene el que **no obliga a partir** la región o el que da la "
+  r"integral más simple (a veces $dy$ evita un cambio de techo)."),
+ ("lista", "Límites de integración", [
+  r"Son las **abscisas (u ordenadas) de las intersecciones**: se igualan las curvas y se resuelve.",
+  r"Cada integrando es positivo (arriba − abajo); con funciones que cambian de signo el área es $\int|f|$."]),
+],
+6: [
+ ("def", "Longitud de arco",
+  r"Si $f$ tiene derivada continua en $[a,b]$:"),
+ ("form", [r"\displaystyle L=\int_a^b\sqrt{1+\big[f'(x)\big]^2}\,dx",
+           r"\displaystyle \text{si } x=g(y):\qquad L=\int_c^d\sqrt{1+\big[g'(y)\big]^2}\,dy"]),
+ ("truco", r"**El radicando casi siempre es un cuadrado perfecto.** Derivá, elevá al cuadrado, sumá $1$ y "
+  r"**simplificá**. Con $\big(x^{3/2}\big)'=\tfrac32x^{1/2}$ conviene la sustitución lineal $u=1+\tfrac94x$."),
+ ("estrategia", r"$\sqrt{h^2}=|h|$: analizá el signo de $h$ en el intervalo antes de quitar el módulo."),
+ ("lista", "Para tener presente", [
+  r"La longitud depende sólo de la curva, no de cómo se la recorra: $L>0$.",
+  r"La condición de $f'$ **continua** garantiza que el arco sea rectificable."]),
+],
+7: [
+ ("def", "Sólidos de revolución — fórmula general",
+  r"Cada corte perpendicular al eje es un **disco** o una **arandela** de área "
+  r"$A=\pi\big(R_{ext}^2-R_{int}^2\big)$, donde cada radio es la **distancia de la curva al eje**."),
+ ("form", [r"\displaystyle \text{Eje } y=c:\quad V=\pi\!\int_a^b\Big(\big[f_{ext}(x)-c\big]^2-\big[f_{int}(x)-c\big]^2\Big)\,dx",
+           r"\displaystyle \text{Eje } x=c:\quad V=\pi\!\int_c^d\Big(\big[g_{ext}(y)-c\big]^2-\big[g_{int}(y)-c\big]^2\Big)\,dy"]),
+ ("truco", r"**Eje horizontal ⇒ corte vertical ⇒ $dx$. Eje vertical ⇒ corte horizontal ⇒ $dy$** y se usan las "
+  r"funciones **inversas** $x=g(y)$."),
+ ("estrategia", r"El eje **no debe atravesar** la región. Radio exterior = borde más lejano al eje; interior = el más "
+  r"cercano. Si el eje coincide con un borde, ese radio es $0$ (disco). Graficar la región y marcar el eje es obligatorio."),
+ ("lista", "Detalles", [
+  r"**Puntos angulosos:** si cambia el borde exterior o interior, el volumen se parte en varias integrales."]),
+ ("def", "Área de superficie de revolución",
+  r"Con $r$ la distancia al eje y $ds$ el elemento de arco:"),
+ ("form", [r"\displaystyle S=2\pi\int r\,ds\qquad\text{con}\qquad ds=\sqrt{1+\big[f'(x)\big]^2}\,dx"]),
+],
+8: [
+ ("def", "Valor promedio",
+  r"Si $f$ es continua en $[a,b]$ su valor promedio es:"),
+ ("form", [r"\displaystyle f_{prom}=\frac{1}{b-a}\int_a^b f(x)\,dx"]),
+ ("def", "Teorema del Valor Medio del Cálculo Integral",
+  r"Si $f$ es continua en $[a,b]$, existe $c\in[a,b]$ tal que:"),
+ ("form", [r"\displaystyle f(c)=\frac{1}{b-a}\int_a^b f(x)\,dx\qquad\Longleftrightarrow\qquad \int_a^b f=f(c)\,(b-a)"]),
+ ("truco", r"**Interpretación geométrica:** el área bajo $f$ coincide con el área del **rectángulo** de base $(b-a)$ y "
+  r"altura $f_{prom}$."),
+ ("estrategia", r"**Cómo hallar $c$:** se resuelve $f(x)=f_{prom}$ y se conservan sólo las soluciones que pertenecen a "
+  r"$[a,b]$ (puede haber más de una)."),
+ ("lista", "Problemas con parámetro", [
+  r"Si el dato es el promedio (por ejemplo «igual a $\frac{\pi}{8b+40}$») se plantea la igualdad y se despeja el extremo o el parámetro.",
+  r"La demostración usa los teoremas de Weierstrass y de los valores intermedios."]),
+],
+9: [
+ ("def", "Indeterminaciones",
+  r"Formas que no se resuelven por sustitución directa: $\frac00,\ \frac\infty\infty,\ 0\cdot\infty,\ "
+  r"\infty-\infty$ y las potencias $1^\infty,\ 0^0,\ \infty^0$."),
+ ("truco", r"**Salvataje algebraico primero:** factorizar y simplificar, racionalizar con el conjugado, "
+  r"denominador común, dividir por la mayor potencia."),
+ ("def", "Regla de L'Hôpital",
+  r"Si $\frac fg$ es $\frac00$ o $\frac\infty\infty$ y existe el límite de $\frac{f'}{g'}$:"),
+ ("form", [r"\displaystyle \lim\frac{f(x)}{g(x)}=\lim\frac{f'(x)}{g'(x)}"]),
+ ("estrategia", r"Se **deriva numerador y denominador por separado** (no es la derivada del cociente) y puede repetirse. "
+  r"El producto $0\cdot\infty$ se pasa a cociente: $f\cdot g=\dfrac{g}{1/f}$."),
+ ("pasos", "Protocolo para potencias $y=f^g$ ($1^\\infty,\\ 0^0,\\ \\infty^0$)", [
+  r"Tomar logaritmo: $\ln y=g\cdot\ln f$.",
+  r"Calcular $L=\lim\ln y$ (queda $0\cdot\infty$ → cociente → L'Hôpital).",
+  r"Concluir: $\lim y=e^{L}$."]),
+ ("form", [r"\displaystyle \lim_{x\to\infty}\left(1+\frac kx\right)^{mx}=e^{km}"]),
+ ("lista", "Más herramientas", [
+  r"**Con el TFC:** $\lim\frac{\int_0^{u(x)}f}{g(x)}$ de la forma $\frac00$ se resuelve derivando la integral con el TFC.",
+  r"**Jerarquía:** una exponencial crece más que cualquier potencia y una potencia más que $\ln$: "
+  r"$\lim\frac{\ln x}{x^p}=0$ y $\lim\frac{x^p}{e^x}=0$."]),
+],
 }
 
 AYUDA = """
@@ -2325,14 +2580,35 @@ AYUDA = """
 | valor absoluto | `abs(x)` |
 | constantes | `pi`, `e`, `oo` (infinito) |
 
-Usá `*` entre factores (`2*x`) y paréntesis en los argumentos (`sen(2*x)`).
+**Escritura natural:** también se entiende `2x`, `x²`, `√x`, `|x|`, `sen x`, `x sen x`,
+`xe^x`, `sen^2 x`, `(x+1)(x-1)`; los paréntesis que falten se cierran solos.
+Debajo de cada campo hay un **teclado virtual** para insertar símbolos con un toque.
 Los puntos de la forma $P(x_0,y_0)$ y los límites aceptan expresiones: `pi/2`, `3/ln(2)^2`.
 """
 
 
+def _bloque_teoria(bloque):
+    tipo = bloque[0]
+    if tipo == "def":
+        st.info(f"**📌 {bloque[1]}**\n\n{bloque[2]}")
+    elif tipo == "form":
+        for f in bloque[1]:
+            st.latex(f)
+    elif tipo == "lista":
+        st.markdown(f"**{bloque[1]}**\n\n" + "\n".join(f"- {i}" for i in bloque[2]))
+    elif tipo == "pasos":
+        st.markdown(f"**{bloque[1]}**\n\n" + "\n".join(
+            f"{n}. {i}" for n, i in enumerate(bloque[2], 1)))
+    elif tipo == "truco":
+        st.success(f"💡 **Truco de la cátedra:** {bloque[1]}")
+    elif tipo == "estrategia":
+        st.warning(f"🧭 **Estrategia de resolución:** {bloque[1]}")
+
+
 def teoria(k):
     with st.expander("📘 Marco Teórico", expanded=False):
-        st.markdown(TEORIA[k])
+        for i, bloque in enumerate(TEORIA[k]):
+            _bloque_teoria(bloque)
 
 
 def main():
@@ -2344,6 +2620,20 @@ def main():
         div[data-baseweb="tab-list"] {overflow-x: auto; flex-wrap: nowrap;}
         button[data-baseweb="tab"] {white-space: nowrap; padding: 0.4rem 0.6rem;}
         h1 {font-size: 1.6rem !important;}
+        /* fórmulas con aire alrededor (marco teórico y resultados) */
+        .katex-display {margin: 1.15em 0 !important;}
+        .katex {font-size: 1.1em;}
+        div[data-testid="stAlert"] {border-radius: 10px;}
+        /* teclado virtual: las filas NO se apilan en el celular */
+        [class*="st-key-kbd_"] [data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important; gap: 0.25rem !important;}
+        [class*="st-key-kbd_"] [data-testid="stColumn"],
+        [class*="st-key-kbd_"] [data-testid="column"] {
+            min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;}
+        [class*="st-key-kbd_"] button {
+            min-height: 2.15rem; padding: 0.1rem 0.15rem; border-radius: 9px;
+            font-size: 0.9rem; font-weight: 600; white-space: nowrap;}
+        [class*="st-key-kbd_"] button p {font-size: 0.9rem; margin: 0;}
         </style>""", unsafe_allow_html=True)
     st.title("📐 " + APP_TITLE)
     st.caption("Herramienta de estudio y verificación: calculá, graficá y comprobá "
